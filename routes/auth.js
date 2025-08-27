@@ -1,141 +1,169 @@
+// routes/auth.js - Freemium authentication system
+
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const rateLimit = require('express-rate-limit');
 const { PrismaClient } = require('@prisma/client');
 
 const router = express.Router();
 const prisma = new PrismaClient();
 
-// Rate limiting pentru autentificare
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minute
-  max: 5, // maxim 5 încercări de login per IP
-  message: {
-    error: 'Prea multe încercări de autentificare. Încearcă din nou în 15 minute.'
-  }
-});
+// Environment setup
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
+if (!process.env.JWT_SECRET) {
+  console.warn('WARNING: JWT_SECRET not set, using fallback key');
+}
 
-// Validări pentru înregistrare
+// Plan configuration
+const PLAN_LIMITS = {
+  free: 10,
+  basic: 100, 
+  premium: 500,
+  enterprise: -1 // unlimited
+};
+
+// Validation rules
 const registerValidation = [
   body('email')
     .isEmail()
     .normalizeEmail()
-    .withMessage('Adresa de email nu este validă'),
+    .withMessage('Valid email is required'),
   body('password')
-    .isLength({ min: 8 })
-    .withMessage('Parola trebuie să aibă minimum 8 caractere')
-    .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
-    .withMessage('Parola trebuie să conțină cel puțin o literă mică, una mare și o cifră'),
+    .isLength({ min: 6 })
+    .withMessage('Password must be at least 6 characters'),
   body('name')
     .trim()
     .isLength({ min: 2, max: 50 })
-    .withMessage('Numele trebuie să aibă între 2 și 50 de caractere'),
-  body('businessName')
-    .optional()
-    .trim()
-    .isLength({ max: 100 })
-    .withMessage('Numele businessului nu poate depăși 100 de caractere')
+    .withMessage('Name must be 2-50 characters')
 ];
 
-// Validări pentru login
 const loginValidation = [
-  body('email')
-    .isEmail()
-    .normalizeEmail()
-    .withMessage('Adresa de email nu este validă'),
-  body('password')
-    .notEmpty()
-    .withMessage('Parola este obligatorie')
+  body('email').isEmail().normalizeEmail(),
+  body('password').notEmpty()
 ];
 
-// Înregistrare utilizator nou
+// REGISTER - Freemium signup
 router.post('/register', registerValidation, async (req, res) => {
   try {
-    // Verifică erorile de validare
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
-        error: 'Date invalide',
+        success: false,
+        error: 'Invalid input',
         details: errors.array()
       });
     }
 
     const { email, password, name, businessName } = req.body;
 
-    // Verifică dacă utilizatorul există deja
+    // Check if user exists
     const existingUser = await prisma.user.findUnique({
       where: { email }
     });
 
     if (existingUser) {
-      return res.status(409).json({
-        error: 'Un cont cu această adresă de email există deja'
+      return res.status(400).json({
+        success: false,
+        error: 'Account with this email already exists'
       });
     }
 
-    // Hash parola
-    const saltRounds = 12;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Creează utilizatorul
-    const user = await prisma.user.create({
-      data: {
-        email,
-        password: hashedPassword,
-        name,
-        businessName: businessName || null,
-        subscriptionPlan: 'free', // plan gratuit implicit
-        subscriptionStatus: 'active',
-        subscriptionExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 zile trial
-      }
+    // Create user and initial usage record in transaction
+    const newUser = await prisma.$transaction(async (tx) => {
+      // Create user with free plan
+      const user = await tx.user.create({
+        data: {
+          email,
+          password: hashedPassword,
+          name,
+          businessName: businessName || null,
+          subscriptionPlan: 'free',
+          subscriptionStatus: 'active',
+          monthlyLimit: PLAN_LIMITS.free,
+          isActive: true,
+          emailVerified: true, // Skip email verification for freemium
+        }
+      });
+
+      // Create usage tracking for current month
+      const now = new Date();
+      await tx.usage.create({
+        data: {
+          userId: user.id,
+          month: now.getMonth(),
+          year: now.getFullYear(),
+          requestCount: 0
+        }
+      });
+
+      return user;
     });
 
-    // Generează JWT token
+    // Generate JWT token
     const token = jwt.sign(
       { 
-        userId: user.id,
-        email: user.email,
-        plan: user.subscriptionPlan 
+        userId: newUser.id,
+        email: newUser.email,
+        plan: newUser.subscriptionPlan 
       },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: '30d' }
     );
 
-    // Nu returna parola în răspuns
-    const { password: _, ...userWithoutPassword } = user;
+    // Remove password from response
+    const { password: _, ...userResponse } = newUser;
 
     res.status(201).json({
-      message: 'Cont creat cu succes',
-      user: userWithoutPassword,
+      success: true,
+      message: 'Account created successfully',
+      user: {
+        ...userResponse,
+        subscriptionActive: true
+      },
       token,
-      expiresIn: '30d'
+      plan: {
+        name: 'Free',
+        limit: PLAN_LIMITS.free,
+        current: 0
+      }
     });
 
   } catch (error) {
-    console.error('Register error:', error);
+    console.error('Registration error:', error);
+    
+    if (error.code === 'P2002') {
+      return res.status(400).json({
+        success: false,
+        error: 'Email already exists'
+      });
+    }
+
     res.status(500).json({
-      error: 'Eroare la crearea contului'
+      success: false,
+      error: 'Failed to create account',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// Login utilizator
-router.post('/login', authLimiter, loginValidation, async (req, res) => {
+// LOGIN - with usage info
+router.post('/login', loginValidation, async (req, res) => {
   try {
-    // Verifică erorile de validare
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({
-        error: 'Date invalide',
-        details: errors.array()
+        success: false,
+        error: 'Invalid credentials format'
       });
     }
 
     const { email, password } = req.body;
 
-    // Găsește utilizatorul
+    // Find user with current month usage
     const user = await prisma.user.findUnique({
       where: { email },
       include: {
@@ -150,77 +178,107 @@ router.post('/login', authLimiter, loginValidation, async (req, res) => {
 
     if (!user) {
       return res.status(401).json({
-        error: 'Email sau parolă incorectă'
+        success: false,
+        error: 'Invalid email or password'
       });
     }
 
-    // Verifică parola
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-    if (!isPasswordValid) {
+    // Check password
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
       return res.status(401).json({
-        error: 'Email sau parolă incorectă'
+        success: false,
+        error: 'Invalid email or password'
       });
     }
 
-    // Verifică dacă abonamentul este activ
-    const isSubscriptionActive = user.subscriptionExpiresAt > new Date();
-    
-    // Generează JWT token
+    // Check if account is active
+    if (!user.isActive) {
+      return res.status(403).json({
+        success: false,
+        error: 'Account is deactivated'
+      });
+    }
+
+    // Generate token
     const token = jwt.sign(
       { 
         userId: user.id,
         email: user.email,
         plan: user.subscriptionPlan 
       },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: '30d' }
     );
 
-    // Actualizează ultima dată de login
+    // Update last login
     await prisma.user.update({
       where: { id: user.id },
       data: { lastLoginAt: new Date() }
     });
 
-    // Nu returna parola în răspuns
-    const { password: _, ...userWithoutPassword } = user;
+    // Calculate subscription status
+    const isSubscriptionActive = user.subscriptionPlan === 'free' ? 
+      true : user.subscriptionExpiresAt > new Date();
+
+    // Get current usage
+    const currentUsage = user.usage[0]?.requestCount || 0;
+
+    // Remove password from response
+    const { password: _, ...userResponse } = user;
 
     res.json({
-      message: 'Autentificare reușită',
+      success: true,
+      message: 'Login successful',
       user: {
-        ...userWithoutPassword,
+        ...userResponse,
         subscriptionActive: isSubscriptionActive
       },
       token,
-      expiresIn: '30d'
+      usage: {
+        current: currentUsage,
+        limit: user.monthlyLimit,
+        remaining: user.monthlyLimit === -1 ? -1 : Math.max(0, user.monthlyLimit - currentUsage),
+        resetDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1)
+      }
     });
 
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({
-      error: 'Eroare la autentificare'
+      success: false,
+      error: 'Login failed'
     });
   }
 });
 
-// Verificarea token-ului
-router.get('/verify', async (req, res) => {
+// VERIFY TOKEN
+router.post('/verify', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
-    const token = authHeader && authHeader.split(' ')[1];
+    const token = authHeader?.split(' ')[1];
 
     if (!token) {
       return res.status(401).json({
-        error: 'Token de acces lipsește'
+        success: false,
+        error: 'No token provided'
       });
     }
 
-    // Verifică token-ul
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Găsește utilizatorul
+    // Verify JWT
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    // Find user with current usage
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
+      include: {
+        usage: {
+          where: {
+            month: new Date().getMonth(),
+            year: new Date().getFullYear()
+          }
+        }
+      },
       select: {
         id: true,
         email: true,
@@ -229,52 +287,130 @@ router.get('/verify', async (req, res) => {
         subscriptionPlan: true,
         subscriptionStatus: true,
         subscriptionExpiresAt: true,
-        createdAt: true
+        monthlyLimit: true,
+        isActive: true,
+        emailVerified: true,
+        createdAt: true,
+        usage: true
+      }
+    });
+
+    if (!user || !user.isActive) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found or inactive'
+      });
+    }
+
+    // Calculate subscription status
+    const isSubscriptionActive = user.subscriptionPlan === 'free' ? 
+      true : user.subscriptionExpiresAt > new Date();
+
+    // Get current usage
+    const currentUsage = user.usage[0]?.requestCount || 0;
+
+    res.json({
+      success: true,
+      valid: true,
+      user: {
+        ...user,
+        subscriptionActive: isSubscriptionActive,
+        usage: undefined // Remove from user object
+      },
+      usage: {
+        current: currentUsage,
+        limit: user.monthlyLimit,
+        remaining: user.monthlyLimit === -1 ? -1 : Math.max(0, user.monthlyLimit - currentUsage),
+        resetDate: new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1)
+      }
+    });
+
+  } catch (error) {
+    console.error('Token verification error:', error);
+    
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired token'
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: 'Token verification failed'
+    });
+  }
+});
+
+// LOGOUT
+router.post('/logout', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Logged out successfully'
+  });
+});
+
+// GET USER STATS (usage, plan info)
+router.get('/stats', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.split(' ')[1];
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required'
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.userId },
+      include: {
+        usage: {
+          where: {
+            month: new Date().getMonth(),
+            year: new Date().getFullYear()
+          }
+        }
       }
     });
 
     if (!user) {
       return res.status(404).json({
-        error: 'Utilizatorul nu a fost găsit'
+        success: false,
+        error: 'User not found'
       });
     }
 
-    // Verifică dacă abonamentul este activ
-    const isSubscriptionActive = user.subscriptionExpiresAt > new Date();
+    const currentUsage = user.usage[0]?.requestCount || 0;
 
     res.json({
-      valid: true,
-      user: {
-        ...user,
-        subscriptionActive: isSubscriptionActive
+      success: true,
+      stats: {
+        plan: user.subscriptionPlan,
+        status: user.subscriptionStatus,
+        usage: {
+          current: currentUsage,
+          limit: user.monthlyLimit,
+          remaining: user.monthlyLimit === -1 ? -1 : Math.max(0, user.monthlyLimit - currentUsage),
+          percentage: user.monthlyLimit === -1 ? 0 : Math.round((currentUsage / user.monthlyLimit) * 100)
+        },
+        subscription: {
+          active: user.subscriptionPlan === 'free' ? true : user.subscriptionExpiresAt > new Date(),
+          expiresAt: user.subscriptionExpiresAt,
+          canUpgrade: user.subscriptionPlan !== 'enterprise'
+        }
       }
     });
 
   } catch (error) {
-    if (error.name === 'JsonWebTokenError') {
-      return res.status(401).json({
-        error: 'Token invalid'
-      });
-    }
-    
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({
-        error: 'Token expirat'
-      });
-    }
-
-    console.error('Token verification error:', error);
+    console.error('Stats error:', error);
     res.status(500).json({
-      error: 'Eroare la verificarea token-ului'
+      success: false,
+      error: 'Failed to get stats'
     });
   }
-});
-
-// Logout (invalidarea token-ului se face pe client)
-router.post('/logout', (req, res) => {
-  res.json({
-    message: 'Deconectare reușită'
-  });
 });
 
 module.exports = router;

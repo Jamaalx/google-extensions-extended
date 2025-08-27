@@ -1,4 +1,5 @@
-// Configurația Prisma
+// Updated schema.prisma for freemium model
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,7 +9,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Modelul pentru utilizatori
 model User {
   id                    String   @id @default(cuid())
   email                 String   @unique
@@ -16,19 +16,27 @@ model User {
   name                  String
   businessName          String?
   
-  // Abonament
+  // Account status
+  isActive              Boolean  @default(true)
+  emailVerified         Boolean  @default(false)
+  verificationToken     String?
+  
+  // Subscription
   subscriptionPlan      String   @default("free") // free, basic, premium, enterprise
-  subscriptionStatus    String   @default("active") // active, cancelled, expired
-  subscriptionExpiresAt DateTime
+  subscriptionStatus    String   @default("active") // active, cancelled, expired, past_due
+  subscriptionExpiresAt DateTime @default(now())
   stripeCustomerId      String?
   stripeSubscriptionId  String?
+  
+  // Usage limits per plan
+  monthlyLimit          Int      @default(10) // free = 10, basic = 100, premium = 500, enterprise = -1
   
   // Metadata
   createdAt             DateTime @default(now())
   updatedAt             DateTime @updatedAt
   lastLoginAt           DateTime?
   
-  // Relații
+  // Relations
   usage                 Usage[]
   apiCalls              ApiCall[]
   businessProfile       BusinessProfile?
@@ -37,48 +45,6 @@ model User {
   @@map("users")
 }
 
-// Modelul pentru profilul de business
-model BusinessProfile {
-  id                   String   @id @default(cuid())
-  userId               String   @unique
-  businessType         String   // restaurant, hotel, medical, retail, beauty, automotive
-  businessName         String
-  description          String?
-  brandVoice           String   @default("professional") // formal, casual, friendly, professional, luxury
-  responseLength       String   @default("medium") // short, medium, long
-  specialInstructions  String?
-  customKeywords       String?  // JSON string cu cuvinte cheie custom
-  
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-  
-  // Relații
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  @@map("business_profiles")
-}
-
-// Modelul pentru template-uri de răspuns
-model ResponseTemplate {
-  id          String   @id @default(cuid())
-  userId      String
-  name        String
-  category    String   // positive, negative, neutral, custom
-  template    String   // Template-ul cu placeholdere {businessName}, {specificMention}, etc.
-  description String?
-  isActive    Boolean  @default(true)
-  usageCount  Int      @default(0)
-  
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  
-  // Relații
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
-  @@map("response_templates")
-}
-
-// Modelul pentru utilizarea lunară
 model Usage {
   id           String @id @default(cuid())
   userId       String
@@ -86,51 +52,81 @@ model Usage {
   year         Int
   requestCount Int    @default(0)
   
-  // Relații
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   
-  // Index compus pentru căutări rapide
   @@unique([userId, month, year])
   @@map("usage")
 }
 
-// Modelul pentru logarea apelurilor API
+model BusinessProfile {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  businessType         String   @default("general")
+  businessName         String
+  description          String?
+  brandVoice           String   @default("professional")
+  responseLength       String   @default("medium")
+  specialInstructions  String?
+  customKeywords       String?
+  
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("business_profiles")
+}
+
+model ResponseTemplate {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  category    String
+  template    String
+  description String?
+  isActive    Boolean  @default(true)
+  usageCount  Int      @default(0)
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("response_templates")
+}
+
 model ApiCall {
   id              String   @id @default(cuid())
   userId          String
   
-  // Detalii cerere
   reviewText      String
   responseText    String
-  language        String
-  tone            String
+  language        String   @default("en")
+  tone            String   @default("professional")
   model           String   @default("gpt-4")
-  businessType    String?  // tipul de business folosit
-  templateId      String?  // template-ul folosit dacă este cazul
+  businessType    String?
+  templateId      String?
   
-  // Metadata
   tokensUsed      Int?
-  cost            Float?   // în USD
-  duration        Int?     // în milisecunde
+  cost            Float?
+  duration        Int?
   success         Boolean  @default(true)
   errorMessage    String?
   
   createdAt       DateTime @default(now())
   
-  // Relații
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   @@map("api_calls")
 }
 
-// Modelul pentru feedback utilizatori
 model Feedback {
   id          String   @id @default(cuid())
   email       String?
   subject     String
   message     String
-  type        String   @default("general") // bug, feature, general
-  status      String   @default("open") // open, in_progress, closed
+  type        String   @default("general")
+  status      String   @default("open")
   
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -138,7 +134,6 @@ model Feedback {
   @@map("feedback")
 }
 
-// Modelul pentru setările sistem
 model SystemSetting {
   id    String @id @default(cuid())
   key   String @unique
